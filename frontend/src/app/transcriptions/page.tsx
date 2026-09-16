@@ -1,0 +1,1650 @@
+'use client'
+
+import { useState, useEffect, useMemo, useRef } from 'react'
+import { useRouter } from 'next/navigation'
+import axios from 'axios'
+import Sidebar from '@/components/Sidebar'
+import {
+  FileText,
+  Clock,
+  CheckCircle,
+  FilePlus,
+  AlertTriangle,
+  RefreshCw,
+  UserCog,
+  Search,
+  User,
+  Tag,
+  Target,
+  ExternalLink,
+  X,
+  Filter,
+  Calendar,
+  Layers,
+  Sun,
+  Moon,
+  Briefcase,
+  Sparkles,
+  Link as LinkIcon,
+  Check,
+  Plus,
+  ArrowUpRight,
+  EyeOff,
+  Eye,
+  Unlink,
+  Trash2,
+  Edit3,
+  Video,
+  ChevronDown,
+} from 'lucide-react'
+import { useTheme } from '@/context/ThemeContext'
+import MotivoVinculo, { Vinculo } from '@/components/MotivoVinculo'
+import SugestoesCadastro from '@/components/SugestoesCadastro'
+
+interface BriefingData {
+  resumo_rapido?: string
+  principais_topicos?: string[]
+  /** Estado do vínculo automático com a atividade R1/R2/R3 do Pipedrive. */
+  vinculo?: Vinculo
+  dados_cliente?: {
+    nome?: string
+    idade?: string
+    estado_civil?: string
+    herdeiros_filhos?: string
+    patrimonio_bens?: string
+    seguros_existentes?: string
+    filhos?: string
+    profissao?: string
+    /** Campos que o prompt novo do Tactiq passou a fornecer. */
+    data_nascimento?: string
+    regime_casamento?: string
+    nome_conjuge?: string
+    conjuge_sem_protecao?: string
+    filhos_sem_protecao?: string
+    filhos_itens?: string[]
+    patrimonio_bens_itens?: string[]
+    seguros_existentes_itens?: string[]
+    patrimonio_estimado?: string
+    renda_mensal?: string
+    objetivos_principais?: string[]
+    principais_dores?: string[]
+    demonstrou_interesse?: string
+  }
+  decisoes_proximos_passos?: string[]
+  proxima_acao?: {
+    descricao?: string
+    responsavel?: string
+    prazo_sugerido?: string
+    canal?: string
+  }
+  pontos_atencao?: string[]
+  observacoes?: string
+  tactiq_link?: string
+  is_ignored?: boolean
+  pipedrive?: {
+    person_id?: string | null
+    deal_id?: string | null
+    person_url?: string | null
+    deal_url?: string | null
+    activity_id?: string | null
+    activity_subject?: string | null
+    activity_type?: string | null
+    activity_date?: string | null
+    note_id?: string | null
+  }
+}
+
+interface Transcription {
+  id: string
+  google_doc_id: string
+  meeting_title: string | null
+  meeting_date: string | null
+  cliente_nome?: string | null
+  processing_status: 'pending' | 'processing' | 'completed' | 'failed'
+  briefing_json: BriefingData | null
+  created_at: string
+}
+
+/**
+ * Situação do negócio, ao lado do nome.
+ *
+ * Importa na hora de escolher: um cliente costuma ter um negócio aberto e
+ * outros perdidos de anos atrás, e anexar a reunião de hoje ao perdido é erro
+ * fácil de cometer quando os dois aparecem iguais na lista.
+ */
+function StatusNegocio({ status }: { status: string | null }) {
+  const mapa: Record<string, { texto: string; classe: string }> = {
+    open: {
+      texto: 'aberto',
+      classe: 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-800 dark:text-emerald-300',
+    },
+    won: {
+      texto: 'ganho',
+      classe: 'bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-300',
+    },
+    lost: {
+      texto: 'perdido',
+      classe: 'bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-400',
+    },
+  }
+  const s = mapa[status || '']
+  if (!s) return null
+  return (
+    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${s.classe}`}>{s.texto}</span>
+  )
+}
+
+/** Um negócio do Pipedrive já com a pessoa dona, para a atribuição manual. */
+interface NegocioParaAtribuir {
+  deal_id: string
+  deal_titulo: string | null
+  status: string | null
+  person_id: string | null
+  person_nome: string | null
+  url: string
+}
+
+/** Pessoa encontrada que não tem negócio nenhum: ainda dá para anexar a ela. */
+interface PessoaSemNegocio {
+  person_id: string
+  person_nome: string | null
+}
+
+export default function TranscriptionsPage() {
+  const router = useRouter()
+  const { theme, isDark, toggleTheme } = useTheme()
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [transcriptions, setTranscriptions] = useState<Transcription[]>([])
+  const [loading, setLoading] = useState(true)
+  const [isSyncing, setIsSyncing] = useState(false)
+  const [selectedItem, setSelectedItem] = useState<Transcription | null>(null)
+  const [statusFilter, setStatusFilter] = useState<string>('all')
+  const [crmFilter, setCrmFilter] = useState<'all' | 'linked' | 'unlinked' | 'ignored'>('all')
+  const [searchTerm, setSearchTerm] = useState('')
+  const [sortBy, setSortBy] = useState<'newest' | 'oldest' | 'client_az' | 'linked_first'>('newest')
+  const [syncFeedback, setSyncFeedback] = useState('')
+
+  // O card fecha por padrão: a lista serve para varrer e achar, não para ler.
+  // Detalhe e ação ficam atrás de um clique deliberado.
+  const [expandidos, setExpandidos] = useState<Set<string>>(new Set())
+  const alternarCard = (id: string) =>
+    setExpandidos((atual) => {
+      const nova = new Set(atual)
+      nova.has(id) ? nova.delete(id) : nova.add(id)
+      return nova
+    })
+
+  // Assign Modal state
+  const [assignItem, setAssignItem] = useState<Transcription | null>(null)
+  // Uma busca só. Antes eram duas abas excludentes — pessoa OU negócio — e a de
+  // negócio pedia o ID, obrigando a garimpar no Pipedrive a cada transcrição.
+  const [termoAtribuir, setTermoAtribuir] = useState('')
+  const [buscandoAtribuir, setBuscandoAtribuir] = useState(false)
+  const [negociosEncontrados, setNegociosEncontrados] = useState<NegocioParaAtribuir[]>([])
+  const [pessoasSemNegocio, setPessoasSemNegocio] = useState<PessoaSemNegocio[]>([])
+  const [selectedPerson, setSelectedPerson] = useState<PessoaSemNegocio | null>(null)
+  const [selectedDeal, setSelectedDeal] = useState<NegocioParaAtribuir | null>(null)
+  const buscaAtribuirId = useRef(0)
+
+  /** Saída de emergência: colar o ID do negócio direto na busca. */
+  const idDigitado = /^\d+$/.test(termoAtribuir.trim()) ? termoAtribuir.trim() : ''
+
+  // Pipedrive Activity settings in Modal
+  const [deleteOldActivity, setDeleteOldActivity] = useState(true)
+  const [submittingAssign, setSubmittingAssign] = useState(false)
+  const [unlinkingId, setUnlinkingId] = useState<string | null>(null)
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [assignSuccess, setAssignSuccess] = useState(false)
+  const [togglingIgnoreId, setTogglingIgnoreId] = useState<string | null>(null)
+  const [motivoAberto, setMotivoAberto] = useState<Vinculo | null>(null)
+  const [itemDoMotivo, setItemDoMotivo] = useState<any>(null)
+  const [reavaliando, setReavaliando] = useState(false)
+  const [avaliandoId, setAvaliandoId] = useState<string | null>(null)
+  const [sugestoesDe, setSugestoesDe] = useState<string | null>(null)
+
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+
+  useEffect(() => {
+    fetchTranscriptions()
+  }, [])
+
+  const fetchTranscriptions = async () => {
+    try {
+      setLoading(true)
+      const token = localStorage.getItem('access_token')
+      if (!token) {
+        router.push('/login')
+        return
+      }
+
+      const response = await axios.get(`${API_URL}/api/transcriptions`, {
+        headers: { Authorization: `Bearer ${token}` },
+        params: { limit: 100 },
+      })
+      setTranscriptions(response.data)
+    } catch (err: any) {
+      if (err.response?.status === 401) {
+        localStorage.removeItem('access_token')
+        router.push('/login')
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleTriggerSync = async () => {
+    try {
+      setIsSyncing(true)
+      setSyncFeedback('')
+      const token = localStorage.getItem('access_token')
+      const res = await axios.post(
+        `${API_URL}/api/webhooks/trigger-sync`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+      setSyncFeedback(res.data?.message || 'Sincronização com o Google Drive concluída!')
+      await fetchTranscriptions()
+      setTimeout(() => {
+        setSyncFeedback('')
+      }, 6000)
+    } catch (err: any) {
+      setSyncFeedback('Erro ao disparar sincronização: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setIsSyncing(false)
+    }
+  }
+
+  // Toggle ignore / internal meeting
+  /**
+   * Avalia o vinculo de uma transcricao que nunca passou pela regra automatica.
+   * Se vincular, some da lista de pendentes; se falhar, abre o motivo.
+   */
+  const handleAvaliarVinculo = async (item: any) => {
+    setAvaliandoId(item.id)
+    try {
+      const token = localStorage.getItem('access_token')
+      const r = await axios.post(
+        `${API_URL}/api/transcriptions/${item.id}/revincular`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } },
+      )
+      if (r.data?.status === 'vinculado') {
+        await fetchTranscriptions()
+      } else {
+        setItemDoMotivo(item)
+        setMotivoAberto({ ...r.data, meeting_title: item.meeting_title })
+      }
+    } catch (e: any) {
+      setItemDoMotivo(item)
+      setMotivoAberto({
+        status: 'nao_vinculado',
+        motivo: 'ERRO_PIPEDRIVE',
+        detalhe: { erro: e?.response?.data?.detail || 'Falha ao avaliar' },
+        meeting_title: item.meeting_title,
+      })
+    } finally {
+      setAvaliandoId(null)
+    }
+  }
+
+  const handleAbrirMotivo = (item: any) => {
+    setItemDoMotivo(item)
+    setMotivoAberto({ ...(item.briefing_json?.vinculo || {}), meeting_title: item.meeting_title })
+  }
+
+  /** Reavalia o vinculo sem reprocessar o documento do Drive. */
+  const handleTentarNovamente = async () => {
+    if (!itemDoMotivo) return
+    setReavaliando(true)
+    try {
+      const token = localStorage.getItem('access_token')
+      const r = await axios.post(
+        `${API_URL}/api/transcriptions/${itemDoMotivo.id}/revincular`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } },
+      )
+      setMotivoAberto({ ...r.data, meeting_title: itemDoMotivo.meeting_title })
+      if (r.data?.status === 'vinculado') {
+        setMotivoAberto(null)
+        fetchTranscriptions()
+      }
+    } catch {
+      // mantem o painel aberto com o motivo anterior
+    } finally {
+      setReavaliando(false)
+    }
+  }
+
+  const handleToggleIgnore = async (transcriptionId: string) => {
+    try {
+      setTogglingIgnoreId(transcriptionId)
+      const token = localStorage.getItem('access_token')
+      const res = await axios.post(
+        `${API_URL}/api/transcriptions/${transcriptionId}/toggle-ignore`,
+        {},
+        { headers: { Authorization: `Bearer ${token}` } }
+      )
+
+      setTranscriptions((prev) =>
+        prev.map((t) =>
+          t.id === transcriptionId
+            ? { ...t, briefing_json: res.data.briefing_json }
+            : t
+        )
+      )
+
+      if (selectedItem?.id === transcriptionId) {
+        setSelectedItem((prev) => (prev ? { ...prev, briefing_json: res.data.briefing_json } : null))
+      }
+    } catch (err: any) {
+      alert('Erro ao alterar status da transcrição: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setTogglingIgnoreId(null)
+    }
+  }
+
+  /**
+   * Tira o card da lista pelo botão do cabeçalho.
+   *
+   * Confirma só quando há vínculo: nesse caso ignorar não é apenas esconder —
+   * o backend apaga a nota e a atividade que esta transcrição criou no
+   * Pipedrive. Sem vínculo não há o que apagar, e pedir confirmação para uma
+   * ação reversível e sem efeito externo seria atrito à toa.
+   */
+  const handleOcultarCard = (item: Transcription, isIgnored: boolean, isLinked: boolean) => {
+    if (!isIgnored && isLinked) {
+      const titulo = item.meeting_title || 'Esta reunião'
+      const ok = window.confirm(
+        `${titulo}\n\n` +
+          'Esta transcrição está vinculada no Pipedrive. Ocultar aqui também remove de lá ' +
+          'a nota e a atividade criadas por ela.\n\n' +
+          'O card continua acessível pelo filtro "Internas / Ignoradas".\n\n' +
+          'Ocultar mesmo assim?'
+      )
+      if (!ok) return
+    }
+    handleToggleIgnore(item.id)
+  }
+
+  // Busca do modal de atribuição: negócios já com a pessoa dona, mais as
+  // pessoas que não têm negócio nenhum.
+  useEffect(() => {
+    if (termoAtribuir.trim().length < 2) {
+      setNegociosEncontrados([])
+      setPessoasSemNegocio([])
+      return
+    }
+
+    const timer = setTimeout(async () => {
+      const idAtual = ++buscaAtribuirId.current
+      try {
+        setBuscandoAtribuir(true)
+        const token = localStorage.getItem('access_token')
+        const res = await axios.get(`${API_URL}/api/pipedrive/buscar-para-atribuir`, {
+          headers: { Authorization: `Bearer ${token}` },
+          params: { term: termoAtribuir.trim() },
+        })
+        if (idAtual !== buscaAtribuirId.current) return // busca já superada
+        setNegociosEncontrados(res.data.itens || [])
+        setPessoasSemNegocio(res.data.pessoas_sem_negocio || [])
+      } catch (err) {
+        if (idAtual === buscaAtribuirId.current) {
+          setNegociosEncontrados([])
+          setPessoasSemNegocio([])
+        }
+        console.error('Erro ao buscar no Pipedrive:', err)
+      } finally {
+        if (idAtual === buscaAtribuirId.current) setBuscandoAtribuir(false)
+      }
+    }, 300)
+
+    return () => clearTimeout(timer)
+  }, [termoAtribuir, API_URL])
+
+  const handleOpenAssignModal = (item: Transcription) => {
+    setAssignItem(item)
+    setSelectedPerson(null)
+    setSelectedDeal(null)
+    setTermoAtribuir(item.briefing_json?.dados_cliente?.nome || '')
+    setDeleteOldActivity(true)
+    setAssignSuccess(false)
+  }
+
+  const handleConfirmAssign = async () => {
+    if (!assignItem) return
+    if (!selectedPerson && !selectedDeal && !idDigitado) {
+      alert('Escolha um negócio ou uma pessoa na busca antes de atribuir.')
+      return
+    }
+
+    try {
+      setSubmittingAssign(true)
+      const token = localStorage.getItem('access_token')
+      // Escolher o negócio já traz a pessoa junto — é o caminho normal. Digitar
+      // o ID cru continua valendo como saída de emergência.
+      const dealIdToAssign = selectedDeal?.deal_id || idDigitado || undefined
+      const personIdToAssign = selectedDeal?.person_id || selectedPerson?.person_id || undefined
+      const clientNameToAssign =
+        selectedDeal?.person_nome || selectedDeal?.deal_titulo || selectedPerson?.person_nome || undefined
+
+      const res = await axios.post(
+        `${API_URL}/api/transcriptions/${assignItem.id}/assign-pipedrive`,
+        {
+          person_id: personIdToAssign ? String(personIdToAssign) : undefined,
+          deal_id: dealIdToAssign ? String(dealIdToAssign) : undefined,
+          cliente_nome: clientNameToAssign,
+          delete_old_activity: deleteOldActivity,
+        },
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      )
+
+      setAssignSuccess(true)
+      setTranscriptions((prev) =>
+        prev.map((t) =>
+          t.id === assignItem.id
+            ? {
+                ...t,
+                briefing_json: res.data.briefing_json,
+                cliente_nome: clientNameToAssign || t.cliente_nome,
+              }
+            : t
+        )
+      )
+
+      if (selectedItem?.id === assignItem.id) {
+        setSelectedItem((prev) =>
+          prev
+            ? {
+                ...prev,
+                briefing_json: res.data.briefing_json,
+                cliente_nome: clientNameToAssign || prev.cliente_nome,
+              }
+            : null
+        )
+      }
+
+      setTimeout(() => {
+        setAssignItem(null)
+        setAssignSuccess(false)
+      }, 1500)
+    } catch (err: any) {
+      alert('Erro ao vincular ao Pipedrive: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setSubmittingAssign(false)
+    }
+  }
+
+  const handleUnlinkTranscription = async (item: Transcription) => {
+    const hasActivity = Boolean(item.briefing_json?.pipedrive?.activity_id || item.briefing_json?.pipedrive?.note_id)
+    const confirmMsg = hasActivity
+      ? `Deseja desvincular a transcrição "${item.meeting_title || 'Reunião'}" do Pipedrive?\n\nA atividade associada no CRM será removida automaticamente.`
+      : `Deseja desvincular a transcrição "${item.meeting_title || 'Reunião'}" do Pipedrive?`
+
+    if (!window.confirm(confirmMsg)) return
+
+    try {
+      setUnlinkingId(item.id)
+      const token = localStorage.getItem('access_token')
+      const res = await axios.delete(
+        `${API_URL}/api/transcriptions/${item.id}/unlink`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          params: { delete_activity: true, delete_note: true },
+        }
+      )
+
+      setTranscriptions((prev) =>
+        prev.map((t) =>
+          t.id === item.id
+            ? {
+                ...t,
+                briefing_json: res.data.briefing_json,
+              }
+            : t
+        )
+      )
+
+      if (selectedItem?.id === item.id) {
+        setSelectedItem((prev) =>
+          prev
+            ? {
+                ...prev,
+                briefing_json: res.data.briefing_json,
+              }
+            : null
+        )
+      }
+    } catch (err: any) {
+      alert('Erro ao desvincular do Pipedrive: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setUnlinkingId(null)
+    }
+  }
+
+  const handleDeleteTranscription = async (item: Transcription) => {
+    if (
+      !window.confirm(
+        `Tem certeza que deseja excluir a transcrição "${item.meeting_title || 'Reunião'}"? Esta ação removerá a atividade associada no Pipedrive.`
+      )
+    ) {
+      return
+    }
+
+    try {
+      setDeletingId(item.id)
+      const token = localStorage.getItem('access_token')
+      await axios.delete(`${API_URL}/api/transcriptions/${item.id}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+
+      setTranscriptions((prev) => prev.filter((t) => t.id !== item.id))
+      if (selectedItem?.id === item.id) {
+        setSelectedItem(null)
+      }
+    } catch (err: any) {
+      alert('Erro ao excluir transcrição: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  const filteredTranscriptions = useMemo(() => {
+    const list = transcriptions.filter((t) => {
+      if (statusFilter !== 'all' && t.processing_status !== statusFilter) return false
+
+      const isIgnored = Boolean(
+        t.briefing_json?.is_ignored || t.briefing_json?.observacoes?.includes('[IGNORADA')
+      )
+      const isLinked = Boolean(
+        t.briefing_json?.pipedrive?.deal_id || t.briefing_json?.pipedrive?.person_id
+      )
+
+      // Ignorada sai de todas as visões menos a dela. Antes ela continuava no
+      // "Todas" só com a tag trocada, então marcar como interna não tirava nada
+      // da frente — a lista crescia igual.
+      if (crmFilter === 'all' && isIgnored) return false
+      if (crmFilter === 'ignored' && !isIgnored) return false
+      if (crmFilter === 'linked' && (!isLinked || isIgnored)) return false
+      if (crmFilter === 'unlinked' && (isLinked || isIgnored)) return false
+
+      if (searchTerm.trim()) {
+        const q = searchTerm.toLowerCase()
+        const title = (t.meeting_title || '').toLowerCase()
+        const client = (t.briefing_json?.dados_cliente?.nome || t.cliente_nome || '').toLowerCase()
+        const topics = (t.briefing_json?.principais_topicos || []).join(' ').toLowerCase()
+        const deal = (t.briefing_json?.pipedrive?.deal_id || '').toLowerCase()
+        if (!title.includes(q) && !client.includes(q) && !topics.includes(q) && !deal.includes(q)) return false
+      }
+      return true
+    })
+
+    return list.sort((a, b) => {
+      if (sortBy === 'newest') {
+        const dateA = new Date(a.meeting_date || a.created_at).getTime()
+        const dateB = new Date(b.meeting_date || b.created_at).getTime()
+        return dateB - dateA
+      }
+      if (sortBy === 'oldest') {
+        const dateA = new Date(a.meeting_date || a.created_at).getTime()
+        const dateB = new Date(b.meeting_date || b.created_at).getTime()
+        return dateA - dateB
+      }
+      if (sortBy === 'client_az') {
+        const nameA = a.briefing_json?.dados_cliente?.nome || a.cliente_nome || a.meeting_title || ''
+        const nameB = b.briefing_json?.dados_cliente?.nome || b.cliente_nome || b.meeting_title || ''
+        return nameA.localeCompare(nameB)
+      }
+      if (sortBy === 'linked_first') {
+        const isLinkedA = Boolean(a.briefing_json?.pipedrive?.deal_id || a.briefing_json?.pipedrive?.person_id) ? 1 : 0
+        const isLinkedB = Boolean(b.briefing_json?.pipedrive?.deal_id || b.briefing_json?.pipedrive?.person_id) ? 1 : 0
+        return isLinkedB - isLinkedA
+      }
+      return 0
+    })
+  }, [transcriptions, statusFilter, crmFilter, searchTerm, sortBy])
+
+  const formatDate = (dateStr?: string | null) => {
+    if (!dateStr) return 'Recente'
+    return new Date(dateStr).toLocaleDateString('pt-BR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  }
+
+  const handleLogout = () => {
+    localStorage.removeItem('access_token')
+    localStorage.removeItem('refresh_token')
+    router.push('/login')
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 dark:bg-[#00061A] flex transition-colors duration-200">
+      {/* Sidebar */}
+      <Sidebar
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+        onLogout={handleLogout}
+      />
+
+      {/* Content Area */}
+      <div
+        className={`flex-1 flex flex-col min-w-0 transition-all duration-300 ${
+          sidebarCollapsed ? 'pl-20' : 'pl-64'
+        }`}
+      >
+        {/* Top Header */}
+        <header className="h-16 bg-white dark:bg-[#000D38] border-b border-slate-200/80 dark:border-[#002060] px-6 sm:px-8 flex items-center justify-between sticky top-0 z-30 transition-colors">
+          <div>
+            <h1 className="text-lg font-bold text-slate-900 dark:text-white tracking-tight font-display">
+              Transcrições & Briefings
+            </h1>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Histórico de reuniões transcritas pelo Tactiq e processadas por IA
+            </p>
+          </div>
+
+          <div className="flex items-center space-x-3">
+            {/* Theme Toggle Button */}
+            <button
+              onClick={toggleTheme}
+              className="p-2 rounded-xl border border-slate-200 dark:border-[#002060] bg-slate-50 dark:bg-[#00061A] hover:bg-slate-100 dark:hover:bg-[#002060] text-slate-600 dark:text-slate-300 transition-colors"
+              title={isDark ? 'Mudar para Tema Claro' : 'Mudar para Tema Escuro'}
+            >
+              {isDark ? <Moon className="w-4 h-4 text-[#00FFFF]" /> : <Sun className="w-4 h-4 text-amber-500" />}
+            </button>
+
+            <button
+              onClick={handleTriggerSync}
+              disabled={isSyncing}
+              className="inline-flex items-center space-x-2 px-3.5 py-2 rounded-xl bg-[#0092FF] hover:bg-[#007AFF] text-white font-bold text-xs shadow-xs shadow-blue-500/20 transition-all disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">
+                {isSyncing ? 'Buscando no Drive...' : 'Sincronizar Drive'}
+              </span>
+            </button>
+          </div>
+        </header>
+
+        {/* Page Content */}
+        <main className="p-6 sm:p-8 space-y-6 max-w-7xl w-full mx-auto">
+          {syncFeedback && (
+            <div className="p-4 rounded-xl bg-blue-50 border border-blue-200 text-xs font-semibold text-blue-800 flex items-center justify-between animate-fade-in">
+              <span>{syncFeedback}</span>
+              <button onClick={() => setSyncFeedback('')} className="text-blue-600 hover:text-blue-800">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Search and Filters Bar */}
+          <div className="bg-white dark:bg-[#000D38] p-4 rounded-2xl border border-slate-200/90 dark:border-[#002060] shadow-sm flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 transition-colors">
+            {/* Search Input & Sort Select */}
+            <div className="flex flex-col sm:flex-row items-center gap-3 flex-1">
+              <div className="relative flex-1 w-full">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  placeholder="Buscar por cliente, tópicos, título ou Deal..."
+                  className="w-full pl-9 pr-4 py-2 bg-slate-50 dark:bg-[#00061A] border border-slate-200 dark:border-[#002060] rounded-xl text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:bg-white dark:focus:bg-[#00061A] focus:ring-2 focus:ring-[#0092FF] focus:border-[#0092FF] outline-none transition-all"
+                />
+              </div>
+
+              {/* Ordenação por Data / Mais Recente */}
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as any)}
+                className="w-full sm:w-56 px-3 py-2 bg-slate-50 dark:bg-[#00061A] border border-slate-200 dark:border-[#002060] rounded-xl text-xs font-medium text-slate-700 dark:text-slate-300 focus:ring-2 focus:ring-[#0092FF] outline-none"
+                title="Ordenar transcrições"
+              >
+                <option value="newest">📅 Mais Recentes (Data ↓)</option>
+                <option value="oldest">⏳ Mais Antigas (Data ↑)</option>
+                <option value="client_az">👤 Nome do Cliente (A-Z)</option>
+                <option value="linked_first">🎯 Vinculadas no CRM Primeiro</option>
+              </select>
+            </div>
+
+            {/* Filter Pills */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-bold text-slate-400 mr-1 uppercase">Filtro:</span>
+              {[
+                // "Ativas" e não "Todas": o filtro deixou de mostrar as
+                // ignoradas, e o rótulo antigo passaria a mentir.
+                { id: 'all', label: 'Ativas' },
+                { id: 'linked', label: 'Vinculadas no CRM' },
+                { id: 'unlinked', label: 'Pendentes de Vínculo' },
+                { id: 'ignored', label: 'Internas / Ignoradas' },
+              ].map((pill) => (
+                <button
+                  key={pill.id}
+                  type="button"
+                  onClick={() => setCrmFilter(pill.id as any)}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all ${
+                    crmFilter === pill.id
+                      ? 'bg-[#0092FF] text-white shadow-[0_0_12px_rgba(0,146,255,0.3)]'
+                      : 'bg-slate-100 dark:bg-[#00061A] text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#002060] border border-transparent dark:border-[#002060]'
+                  }`}
+                >
+                  {pill.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Cards Grid */}
+          {loading ? (
+            <div className="py-20 text-center space-y-3">
+              <div className="w-10 h-10 border-3 border-[#0092FF] border-t-transparent rounded-full animate-spin mx-auto"></div>
+              <p className="text-xs font-semibold text-slate-600 dark:text-slate-300">Carregando transcrições...</p>
+            </div>
+          ) : filteredTranscriptions.length === 0 ? (
+            <div className="py-20 bg-white dark:bg-[#000D38] rounded-2xl border border-slate-200/90 dark:border-[#002060] text-center p-6 shadow-sm">
+              <FileText className="w-12 h-12 mx-auto text-slate-400 mb-3 opacity-60" />
+              <h3 className="text-sm font-bold text-slate-900 dark:text-white font-display">
+                Nenhuma transcrição encontrada
+              </h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-sm mx-auto">
+                Não há transcrições com os filtros selecionados.
+              </p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 items-start">
+              {filteredTranscriptions.map((item) => {
+                const briefing = item.briefing_json
+                const isIgnored = Boolean(briefing?.is_ignored)
+                const clientName = briefing?.dados_cliente?.nome || item.cliente_nome
+                const isLinked = Boolean(
+                  briefing?.pipedrive?.deal_id || briefing?.pipedrive?.person_id
+                )
+                const personId = briefing?.pipedrive?.person_id
+                const dealId = briefing?.pipedrive?.deal_id
+                const personUrl = briefing?.pipedrive?.person_url || (personId ? `https://investimentosblue.pipedrive.com/person/${personId}` : null)
+                const dealUrl = briefing?.pipedrive?.deal_url || (dealId ? `https://investimentosblue.pipedrive.com/deal/${dealId}` : null)
+                const aberto = expandidos.has(item.id)
+                // Evita a faixa com borda superior vazia quando a transcrição
+                // não está vinculada mas já foi avaliada com sucesso.
+                const temAcoes =
+                  !isIgnored &&
+                  (isLinked ||
+                    briefing?.vinculo?.status === 'nao_vinculado' ||
+                    !briefing?.vinculo)
+
+                return (
+                  <div
+                    key={item.id}
+                    className={`bg-white dark:bg-[#000D38] rounded-2xl border shadow-sm hover:shadow-md transition-all overflow-hidden ${
+                      isIgnored
+                        ? 'border-slate-200/60 dark:border-[#002060]/50 opacity-75'
+                        : 'border-slate-200/90 dark:border-[#002060] dark:hover:border-[#0092FF]/50'
+                    }`}
+                  >
+                    {/* Cabeçalho: só o que serve para achar a reunião na lista */}
+                    <div className="p-4">
+                      <div className="flex items-start justify-between gap-2 mb-2">
+                        {isIgnored ? (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-900/60 text-slate-500 dark:text-slate-400 border border-slate-200 dark:border-slate-800 flex items-center space-x-1">
+                            <EyeOff className="w-3 h-3" aria-hidden="true" />
+                            <span>Interna / Ignorada</span>
+                          </span>
+                        ) : isLinked && briefing?.vinculo?.motivo === 'ATIVIDADE_CRIADA' ? (
+                          // Vinculado, mas não à reunião do cliente: a automação
+                          // não achou R1/R2/R3 na data e abriu uma Tactiq. É o
+                          // sinal de que falta a reunião na agenda, e some se
+                          // usar a mesma tag verde do vínculo normal.
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-400 border border-sky-200 dark:border-sky-800/60 flex items-center space-x-1">
+                            <FilePlus className="w-3 h-3" aria-hidden="true" />
+                            <span>Atividade Tactiq criada</span>
+                          </span>
+                        ) : isLinked ? (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/60 flex items-center space-x-1">
+                            <CheckCircle className="w-3 h-3" aria-hidden="true" />
+                            <span>Vinculado no Pipedrive</span>
+                          </span>
+                        ) : (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800/60 flex items-center space-x-1">
+                            <Clock className="w-3 h-3" aria-hidden="true" />
+                            <span>Pendente de Vínculo</span>
+                          </span>
+                        )}
+
+                        <div className="flex items-center gap-1.5 flex-shrink-0">
+                          <span className="text-[11px] text-slate-400 font-medium">
+                            {formatDate(item.meeting_date || item.created_at)}
+                          </span>
+
+                          <button
+                            onClick={() => handleOcultarCard(item, isIgnored, isLinked)}
+                            disabled={togglingIgnoreId === item.id}
+                            aria-label={
+                              isIgnored
+                                ? `Reativar ${item.meeting_title || 'esta reunião'}`
+                                : `Ocultar ${item.meeting_title || 'esta reunião'} da lista`
+                            }
+                            title={
+                              isIgnored
+                                ? 'Reativar e devolver à lista'
+                                : isLinked
+                                  ? 'Ocultar da lista (remove a nota e a atividade do Pipedrive)'
+                                  : 'Ocultar da lista'
+                            }
+                            className={`p-1 rounded-lg transition-colors disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0092FF] ${
+                              isIgnored
+                                ? 'text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-blue-950/40'
+                                : 'text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40'
+                            }`}
+                          >
+                            {isIgnored ? (
+                              <Eye className="w-3.5 h-3.5" aria-hidden="true" />
+                            ) : (
+                              <EyeOff className="w-3.5 h-3.5" aria-hidden="true" />
+                            )}
+                          </button>
+                        </div>
+                      </div>
+
+                      <h3
+                        className="text-sm font-bold text-slate-900 dark:text-white leading-snug line-clamp-2 font-display"
+                        title={item.meeting_title || 'Reunião Tactiq'}
+                      >
+                        {item.meeting_title || 'Reunião Tactiq'}
+                      </h3>
+
+                      <button
+                        onClick={() => alternarCard(item.id)}
+                        aria-expanded={aberto}
+                        aria-controls={`detalhe-${item.id}`}
+                        className="mt-3 w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-[#002060] text-[11px] font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-[#002060] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[#0092FF]"
+                      >
+                        <ChevronDown
+                          className={`w-3.5 h-3.5 transition-transform ${aberto ? 'rotate-180' : ''}`}
+                          aria-hidden="true"
+                        />
+                        {aberto ? 'Fechar' : 'Abrir'}
+                      </button>
+                    </div>
+
+                    {/* Detalhe e ações. `hidden` em vez de altura zero para que
+                        Tab e leitor de tela pulem o conteúdo fechado. */}
+                    <div
+                      id={`detalhe-${item.id}`}
+                      hidden={!aberto}
+                      className="px-4 pb-4 space-y-3 border-t border-slate-100 dark:border-[#002060] pt-3"
+                    >
+                      {clientName && (
+                        <p className="text-xs text-slate-700 dark:text-slate-300 font-semibold flex items-center space-x-1.5">
+                          <User className="w-3.5 h-3.5 text-[#0092FF] flex-shrink-0" aria-hidden="true" />
+                          <span className="truncate">{clientName}</span>
+                        </p>
+                      )}
+
+                      <div>
+                        <span className="text-[10px] uppercase font-bold text-slate-400 font-display block mb-1.5">
+                          Vínculo no Pipedrive
+                        </span>
+
+                        {isIgnored ? (
+                          /* Reativar fica no botão do cabeçalho, não aqui. */
+                          <span className="text-slate-400 italic text-[11px]">
+                            Marcada como reunião interna
+                          </span>
+                        ) : isLinked ? (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {personUrl && (
+                              <a
+                                href={personUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 text-[#0092FF] dark:text-[#00FFFF] font-bold text-[11px] hover:bg-blue-100 dark:hover:bg-blue-900/60 transition-colors"
+                                title="Abrir Pessoa no Pipedrive"
+                              >
+                                <span>👤 Pessoa #{personId}</span>
+                                <ArrowUpRight className="w-3 h-3" aria-hidden="true" />
+                              </a>
+                            )}
+
+                            {dealUrl && (
+                              <a
+                                href={dealUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-[#002060] text-white font-semibold text-[11px] hover:bg-[#001D99] transition-colors"
+                                title="Abrir Negócio (Deal) no Pipedrive"
+                              >
+                                <span>💼 Deal #{dealId}</span>
+                                <ArrowUpRight className="w-3 h-3" aria-hidden="true" />
+                              </a>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-slate-400 italic text-[11px]">
+                              Nenhum negócio vinculado
+                            </span>
+                            <button
+                              onClick={() => handleOpenAssignModal(item)}
+                              className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-[#0092FF] hover:bg-[#007AFF] text-white font-bold text-[11px] shadow-xs shadow-blue-500/20 transition-all"
+                            >
+                              <Sparkles className="w-3 h-3" aria-hidden="true" />
+                              <span>Atribuir</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {(item.google_doc_id || briefing?.tactiq_link) && (
+                        <div>
+                          <span className="text-[10px] uppercase font-bold text-slate-400 font-display block mb-1.5">
+                            Documentos
+                          </span>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {item.google_doc_id && (
+                              <a
+                                href={`https://docs.google.com/document/d/${item.google_doc_id}/edit`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center space-x-1 px-2.5 py-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-800 dark:text-emerald-400 font-semibold text-[11px] border border-emerald-200 dark:border-emerald-800/60 transition-colors"
+                                title="Abrir Google Doc original"
+                              >
+                                <span>Google Drive</span>
+                                <ArrowUpRight className="w-3 h-3" aria-hidden="true" />
+                              </a>
+                            )}
+
+                            {briefing?.tactiq_link && (
+                              <a
+                                href={briefing.tactiq_link}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center space-x-1 px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-[#00061A] hover:bg-slate-200 dark:hover:bg-[#002060] text-slate-700 dark:text-slate-300 font-semibold text-[11px] border border-transparent dark:border-[#002060] transition-colors"
+                                title="Abrir no Tactiq"
+                              >
+                                <span>Tactiq</span>
+                                <ArrowUpRight className="w-3 h-3" aria-hidden="true" />
+                              </a>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {temAcoes && (
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-2 border-t border-slate-100 dark:border-[#002060]">
+                          {isLinked && (
+                            <>
+                              <button
+                                onClick={() => handleOpenAssignModal(item)}
+                                className="text-[11px] font-bold text-[#0092FF] dark:text-[#00FFFF] hover:underline flex items-center space-x-1"
+                                title="Reatribuir para outro Cliente ou Negócio"
+                              >
+                                <Edit3 className="w-3 h-3" aria-hidden="true" />
+                                <span>Alterar vínculo</span>
+                              </button>
+
+                              <button
+                                onClick={() => handleUnlinkTranscription(item)}
+                                disabled={unlinkingId === item.id}
+                                className="text-[11px] font-bold text-rose-500 hover:text-rose-700 dark:hover:text-rose-400 flex items-center space-x-1 transition-colors disabled:opacity-50"
+                                title="Desvincular do Pipedrive e apagar nota"
+                              >
+                                <Unlink className={`w-3 h-3 ${unlinkingId === item.id ? 'animate-spin' : ''}`} aria-hidden="true" />
+                                <span>{unlinkingId === item.id ? 'Desvinculando...' : 'Desvincular'}</span>
+                              </button>
+
+                              <button
+                                onClick={() => setSugestoesDe(item.id)}
+                                className="text-[11px] font-bold text-[#0092FF] dark:text-[#00FFFF] hover:underline flex items-center space-x-1"
+                              >
+                                <UserCog className="w-3 h-3" aria-hidden="true" />
+                                <span>Atualizar cadastro</span>
+                              </button>
+                            </>
+                          )}
+
+                          {/* Dois estados na mesma posição:
+                              - falhou  -> explica o motivo
+                              - nunca avaliado -> dispara a avaliação
+                              Sem o segundo caso, as transcrições anteriores a
+                              esta funcionalidade nunca teriam como ser
+                              avaliadas pela tela. */}
+                          {item.briefing_json?.vinculo?.status === 'nao_vinculado' && (
+                            <button
+                              onClick={() => handleAbrirMotivo(item)}
+                              className="text-[11px] font-bold text-amber-600 dark:text-amber-400 hover:underline flex items-center space-x-1"
+                            >
+                              <AlertTriangle className="w-3 h-3" aria-hidden="true" />
+                              <span>Por que não vinculou?</span>
+                            </button>
+                          )}
+
+                          {!item.briefing_json?.vinculo && (
+                            <button
+                              onClick={() => handleAvaliarVinculo(item)}
+                              disabled={avaliandoId === item.id}
+                              className="text-[11px] font-bold text-slate-500 dark:text-slate-400 hover:text-[#0092FF] hover:underline flex items-center space-x-1 disabled:opacity-50"
+                            >
+                              <RefreshCw className={`w-3 h-3 ${avaliandoId === item.id ? 'animate-spin' : ''}`} aria-hidden="true" />
+                              <span>{avaliandoId === item.id ? 'Avaliando...' : 'Avaliar vínculo'}</span>
+                            </button>
+                          )}
+
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </main>
+      </div>
+
+      {/* ASSIGN TO PIPEDRIVE MODAL */}
+      {assignItem && (
+        <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-white dark:bg-[#000D38] rounded-3xl max-w-xl w-full max-h-[90vh] overflow-hidden flex flex-col shadow-2xl border border-slate-200/90 dark:border-[#002060]">
+            {/* Modal Header */}
+            <div className="p-5 border-b border-slate-200 dark:border-[#002060] bg-slate-50 dark:bg-[#00061A] flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <div className="p-2.5 bg-blue-50 dark:bg-blue-950/50 text-[#0092FF] dark:text-[#00FFFF] rounded-xl border border-blue-200 dark:border-blue-800/60">
+                  <Briefcase className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white font-display">
+                    Atribuir Transcrição ao Pipedrive
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 truncate max-w-sm">
+                    {assignItem.meeting_title}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setAssignItem(null)}
+                className="p-2 rounded-xl text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-200 dark:hover:bg-[#002060] transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 overflow-y-auto space-y-5">
+              {/* Uma busca só. Escolher o negócio já traz a pessoa junto, que é o
+                  que a atribuição precisa: antes eram duas abas excludentes e a
+                  de negócio pedia o ID, obrigando a garimpar no Pipedrive. */}
+              <div className="space-y-3">
+                <label
+                  htmlFor="busca-atribuir"
+                  className="block text-xs font-bold text-slate-700 dark:text-slate-300"
+                >
+                  Busque pelo nome do cliente — os negócios dele aparecem abaixo:
+                </label>
+                <div className="relative">
+                  <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" aria-hidden="true" />
+                  <input
+                    id="busca-atribuir"
+                    type="text"
+                    value={termoAtribuir}
+                    onChange={(e) => {
+                      setTermoAtribuir(e.target.value)
+                      setSelectedDeal(null)
+                      setSelectedPerson(null)
+                    }}
+                    placeholder="Ex: Douglas, Márcio, Pamela..."
+                    className="w-full pl-9 pr-9 py-2.5 bg-slate-50 dark:bg-[#00061A] border border-slate-200 dark:border-[#002060] rounded-xl text-xs text-slate-900 dark:text-white placeholder:text-slate-400 focus:bg-white focus:ring-2 focus:ring-[#0092FF] outline-none"
+                  />
+                  {buscandoAtribuir && (
+                    <RefreshCw className="w-3.5 h-3.5 absolute right-3 top-1/2 -translate-y-1/2 text-[#0092FF] animate-spin" aria-hidden="true" />
+                  )}
+                </div>
+
+                <div className="space-y-1.5 max-h-64 overflow-y-auto" aria-live="polite">
+                  {negociosEncontrados.map((d) => {
+                    const isSel = selectedDeal?.deal_id === d.deal_id
+                    return (
+                      <button
+                        key={d.deal_id}
+                        type="button"
+                        onClick={() => {
+                          setSelectedDeal(d)
+                          setSelectedPerson(null)
+                        }}
+                        className={`w-full text-left p-3 rounded-xl border text-xs transition-all flex items-center justify-between gap-3 ${
+                          isSel
+                            ? 'bg-blue-50 dark:bg-blue-950/60 border-[#0092FF] text-[#0092FF] dark:text-[#00FFFF]'
+                            : 'bg-white dark:bg-[#00061A]/80 border-slate-200 dark:border-[#002060] text-slate-800 dark:text-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        <span className="min-w-0">
+                          <span className="font-bold flex items-center gap-1.5 flex-wrap">
+                            <span className="truncate">{d.deal_titulo || 'sem título'}</span>
+                            <span className="text-[10px] font-mono text-slate-400">#{d.deal_id}</span>
+                            <StatusNegocio status={d.status} />
+                          </span>
+                          {d.person_nome && d.person_nome !== d.deal_titulo && (
+                            <span className="block text-[11px] text-slate-400 truncate">
+                              {d.person_nome}
+                            </span>
+                          )}
+                        </span>
+                        {isSel && <Check className="w-4 h-4 text-[#0092FF] flex-shrink-0" aria-hidden="true" />}
+                      </button>
+                    )
+                  })}
+
+                  {pessoasSemNegocio.map((p) => {
+                    const isSel = selectedPerson?.person_id === p.person_id
+                    return (
+                      <button
+                        key={`p-${p.person_id}`}
+                        type="button"
+                        onClick={() => {
+                          setSelectedPerson(p)
+                          setSelectedDeal(null)
+                        }}
+                        className={`w-full text-left p-3 rounded-xl border border-dashed text-xs transition-all flex items-center justify-between gap-3 ${
+                          isSel
+                            ? 'bg-blue-50 dark:bg-blue-950/60 border-[#0092FF] text-[#0092FF] dark:text-[#00FFFF]'
+                            : 'bg-white dark:bg-[#00061A]/80 border-slate-300 dark:border-[#002060] text-slate-800 dark:text-slate-200 hover:border-slate-400'
+                        }`}
+                      >
+                        <span className="min-w-0">
+                          <span className="font-bold truncate block">{p.person_nome || 'sem nome'}</span>
+                          <span className="block text-[11px] text-slate-400">
+                            Pessoa sem negócio — anexa só ao contato
+                          </span>
+                        </span>
+                        {isSel && <Check className="w-4 h-4 text-[#0092FF] flex-shrink-0" aria-hidden="true" />}
+                      </button>
+                    )
+                  })}
+
+                  {termoAtribuir.trim().length >= 2 &&
+                    !buscandoAtribuir &&
+                    negociosEncontrados.length === 0 &&
+                    pessoasSemNegocio.length === 0 && (
+                      <p className="text-xs text-slate-400 italic text-center py-3">
+                        Nada encontrado no Pipedrive com esse termo.
+                      </p>
+                    )}
+                </div>
+
+                {idDigitado && !selectedDeal && !selectedPerson && (
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Nada selecionado: vai usar o negócio <strong>#{idDigitado}</strong> direto,
+                    pelo número que você digitou.
+                  </p>
+                )}
+              </div>
+
+              {/* Selected Summary Card */}
+              {(selectedPerson || selectedDeal) && (
+                <div className="p-3.5 rounded-2xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800/60 text-xs flex items-center justify-between animate-fade-in">
+                  <div>
+                    <span className="text-[10px] uppercase font-bold text-emerald-700 dark:text-emerald-400 block">
+                      Novo Vínculo Selecionado:
+                    </span>
+                    <p className="font-bold text-slate-900 dark:text-white mt-0.5">
+                      {selectedPerson
+                        ? `👤 ${selectedPerson.person_nome} (pessoa #${selectedPerson.person_id})`
+                        : `💼 ${selectedDeal?.deal_titulo} (negócio #${selectedDeal?.deal_id})`}
+                    </p>
+                  </div>
+                  <span className="px-2 py-1 bg-emerald-100 dark:bg-emerald-900/60 text-emerald-800 dark:text-emerald-300 font-bold rounded-lg text-[10px]">
+                    Pronto para Vincular
+                  </span>
+                </div>
+              )}
+
+              {/* Reassign Warning Banner */}
+              {Boolean(assignItem.briefing_json?.pipedrive?.person_id || assignItem.briefing_json?.pipedrive?.deal_id) && (
+                <div className="p-3.5 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-xs flex items-start space-x-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+                  <div>
+                    <p className="font-bold text-amber-900 dark:text-amber-300">
+                      Reatribuindo Transcrição já Vinculada
+                    </p>
+                    <p className="text-amber-700 dark:text-amber-400 text-[11px] mt-0.5">
+                      Esta transcrição já possui vínculo anterior no Pipedrive. Ao confirmar a nova atribuição, a nota anterior será excluída do CRM e transferida para o novo contato/deal selecionado.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Automation Note Info */}
+              <div className="pt-3 border-t border-slate-100 dark:border-[#002060] text-xs space-y-3 bg-slate-50/60 dark:bg-[#00061A]/50 p-4 rounded-2xl border border-slate-200/80 dark:border-[#002060]">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] uppercase font-bold text-[#0092FF] dark:text-[#00FFFF] tracking-wider flex items-center space-x-1.5">
+                    <span>📝 Nota Pipedrive</span>
+                    <span className="px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/60 text-[9px] font-extrabold text-[#002060] dark:text-[#00FFFF]">
+                      Briefing Reunião
+                    </span>
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400 font-bold">
+                    Origem: Transcrição Tactiq
+                  </span>
+                </div>
+
+                <div className="space-y-2 pt-1 border-t border-slate-200/60 dark:border-[#002060]/60">
+                  {Boolean(assignItem.briefing_json?.pipedrive?.activity_id || assignItem.briefing_json?.pipedrive?.note_id) && (
+                    <label className="flex items-center space-x-2.5 text-rose-700 dark:text-rose-400 font-bold">
+                      <input
+                        type="checkbox"
+                        checked={deleteOldActivity}
+                        onChange={(e) => setDeleteOldActivity(e.target.checked)}
+                        className="w-4 h-4 rounded text-rose-600 focus:ring-rose-500"
+                      />
+                      <span>
+                        Excluir registro anterior no Pipedrive{' '}
+                        {assignItem.briefing_json?.pipedrive?.note_id
+                          ? `(Nota #${assignItem.briefing_json.pipedrive.note_id})`
+                          : assignItem.briefing_json?.pipedrive?.activity_id
+                          ? `(Atividade #${assignItem.briefing_json.pipedrive.activity_id})`
+                          : ''}
+                      </span>
+                    </label>
+                  )}
+                  
+                  <p className="text-[11px] text-slate-400 dark:text-slate-500 pl-6.5">
+                    O briefing completo (resumo executivo, tópicos, dados do cliente, decisões e link de gravação) será adicionado como nota no perfil do cliente/negócio.
+                  </p>
+                </div>
+              </div>
+
+              {assignSuccess && (
+                <div className="p-3 rounded-xl bg-emerald-100 text-emerald-800 font-bold text-xs text-center animate-fade-in">
+                  ✅ Transcrição vinculada e Nota criada com sucesso no Pipedrive!
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-5 border-t border-slate-200 dark:border-[#002060] bg-slate-50 dark:bg-[#00061A] flex items-center justify-between">
+              <button
+                type="button"
+                onClick={() => {
+                  const it = assignItem
+                  setAssignItem(null)
+                  handleToggleIgnore(it.id)
+                }}
+                className="text-xs font-bold text-slate-500 hover:text-slate-800 dark:hover:text-slate-200 flex items-center space-x-1"
+              >
+                <EyeOff className="w-3.5 h-3.5" />
+                <span>Marcar como Reunião Interna (Ignorar)</span>
+              </button>
+
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => setAssignItem(null)}
+                  className="px-4 py-2 rounded-xl text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#002060] transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmAssign}
+                  disabled={submittingAssign || (!selectedPerson && !selectedDeal && !idDigitado)}
+                  className="inline-flex items-center space-x-2 px-5 py-2.5 rounded-xl bg-[#0092FF] hover:bg-[#007AFF] text-white font-bold text-xs shadow-lg shadow-blue-500/25 transition-all disabled:opacity-50"
+                >
+                  <Sparkles className={`w-3.5 h-3.5 ${submittingAssign ? 'animate-spin' : ''}`} />
+                  <span>{submittingAssign ? 'Sincronizando...' : 'Confirmar & Vincular ao CRM'}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BRIEFING MODAL */}
+      {selectedItem && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-[#000D38] rounded-2xl max-w-2xl w-full max-h-[88vh] overflow-hidden flex flex-col shadow-2xl animate-scale-in border border-slate-200/80 dark:border-[#002060]">
+            <div className="p-5 border-b border-slate-200 dark:border-[#002060] bg-slate-50 dark:bg-[#00061A] flex items-center justify-between">
+              <div>
+                <span className="text-[10px] uppercase font-bold tracking-wider text-[#0092FF] dark:text-[#00FFFF] block">
+                  Briefing Extraído via IA
+                </span>
+                <h3 className="text-base font-bold text-slate-900 dark:text-white mt-0.5">
+                  {selectedItem.meeting_title || 'Reunião'}
+                </h3>
+              </div>
+              <div className="flex items-center space-x-2">
+                {selectedItem.google_doc_id && (
+                  <a
+                    href={`https://docs.google.com/document/d/${selectedItem.google_doc_id}/edit`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center space-x-1 px-2.5 py-1.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-800 dark:text-emerald-400 font-semibold text-xs border border-emerald-200 dark:border-emerald-800/60 transition-colors"
+                  >
+                    <span>Google Drive</span>
+                    <ArrowUpRight className="w-3 h-3" />
+                  </a>
+                )}
+                {selectedItem.briefing_json?.tactiq_link && (
+                  <a
+                    href={selectedItem.briefing_json.tactiq_link}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center space-x-1 px-2.5 py-1.5 rounded-xl bg-slate-100 dark:bg-[#00061A] hover:bg-slate-200 dark:hover:bg-[#002060] text-slate-700 dark:text-slate-300 font-semibold text-xs border border-slate-200 dark:border-[#002060] transition-colors"
+                  >
+                    <span>Tactiq</span>
+                    <ArrowUpRight className="w-3 h-3" />
+                  </a>
+                )}
+                <button
+                  onClick={() => setSelectedItem(null)}
+                  className="p-2 rounded-xl text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-200 dark:hover:bg-[#002060] transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 overflow-y-auto space-y-6">
+              {/* Link da Reunião no Tactiq em Destaque no Topo */}
+              {selectedItem.briefing_json?.tactiq_link && (
+                <div className="p-4 rounded-2xl bg-slate-900 text-white dark:bg-[#00061A] border border-slate-800 dark:border-[#0092FF]/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-md">
+                  <div className="flex items-center space-x-3 min-w-0">
+                    <div className="p-2.5 rounded-xl bg-[#0092FF]/20 text-[#0092FF] dark:text-[#00FFFF] flex-shrink-0">
+                      <Video className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <span className="text-[10px] uppercase font-bold text-slate-400 block tracking-wider">
+                        Gravação & Transcrição no Tactiq
+                      </span>
+                      <a
+                        href={selectedItem.briefing_json.tactiq_link}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-xs font-bold text-white hover:text-[#00FFFF] truncate block transition-colors font-mono"
+                        title={selectedItem.briefing_json.tactiq_link}
+                      >
+                        {selectedItem.briefing_json.tactiq_link}
+                      </a>
+                    </div>
+                  </div>
+                  <a
+                    href={selectedItem.briefing_json.tactiq_link}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center justify-center space-x-2 px-4 py-2.5 rounded-xl bg-[#0092FF] hover:bg-[#007AFF] text-white font-bold text-xs shadow-md transition-all self-stretch sm:self-auto whitespace-nowrap"
+                  >
+                    <span>Abrir Gravação no Tactiq</span>
+                    <ArrowUpRight className="w-4 h-4" />
+                  </a>
+                </div>
+              )}
+
+              {/* Resumo Rápido Executivo se existir */}
+              {selectedItem.briefing_json?.resumo_rapido && (
+                <div className="p-4 rounded-2xl bg-blue-50/70 dark:bg-[#002060]/30 border border-blue-200 dark:border-[#0092FF]/40 text-xs">
+                  <h4 className="text-[11px] font-extrabold uppercase tracking-wider text-[#0092FF] dark:text-[#00FFFF] mb-1.5 flex items-center space-x-1.5">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Resumo Executivo</span>
+                  </h4>
+                  <p className="text-slate-800 dark:text-slate-200 leading-relaxed font-medium">
+                    {selectedItem.briefing_json.resumo_rapido}
+                  </p>
+                </div>
+              )}
+
+              {/* Dados do Cliente */}
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 font-display">
+                  Dados do Cliente
+                </h4>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs bg-slate-50 dark:bg-[#00061A]/80 p-4 rounded-2xl border border-slate-200 dark:border-[#002060]">
+                  <div>
+                    <span className="text-slate-400 block text-[10px]">Nome:</span>
+                    <span className="font-bold text-slate-900 dark:text-white">
+                      {selectedItem.briefing_json?.dados_cliente?.nome || selectedItem.cliente_nome || 'N/A'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block text-[10px]">Idade:</span>
+                    <span className="font-medium text-slate-800 dark:text-slate-200">
+                      {selectedItem.briefing_json?.dados_cliente?.idade || 'Não informado'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block text-[10px]">Estado Civil:</span>
+                    <span className="font-medium text-slate-800 dark:text-slate-200">
+                      {selectedItem.briefing_json?.dados_cliente?.estado_civil || 'Não informado'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block text-[10px]">Herdeiros / Filhos:</span>
+                    <span className="font-medium text-slate-800 dark:text-slate-200">
+                      {selectedItem.briefing_json?.dados_cliente?.herdeiros_filhos || selectedItem.briefing_json?.dados_cliente?.filhos || 'Não informado'}
+                    </span>
+                  </div>
+                  {selectedItem.briefing_json?.dados_cliente?.patrimonio_bens && (
+                    <div className="sm:col-span-2">
+                      <span className="text-slate-400 block text-[10px]">Patrimônio / Bens:</span>
+                      <span className="font-medium text-slate-800 dark:text-slate-200">
+                        {selectedItem.briefing_json.dados_cliente.patrimonio_bens}
+                      </span>
+                    </div>
+                  )}
+                  {selectedItem.briefing_json?.dados_cliente?.seguros_existentes && (
+                    <div className="sm:col-span-2">
+                      <span className="text-slate-400 block text-[10px]">Seguros & Previdência Existentes:</span>
+                      <span className="font-medium text-slate-800 dark:text-slate-200">
+                        {selectedItem.briefing_json.dados_cliente.seguros_existentes}
+                      </span>
+                    </div>
+                  )}
+                  <div className="sm:col-span-2">
+                    <span className="text-slate-400 block text-[10px]">Demonstrou Interesse:</span>
+                    <span className="font-medium text-slate-800 dark:text-slate-200">
+                      {selectedItem.briefing_json?.dados_cliente?.demonstrou_interesse || 'Não informado'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Tópicos */}
+              {selectedItem.briefing_json?.principais_topicos && selectedItem.briefing_json.principais_topicos.length > 0 && (
+                <div>
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 font-display">
+                    Principais Tópicos Abordados
+                  </h4>
+                  <ul className="space-y-1.5 text-xs text-slate-700 dark:text-slate-300 list-disc list-inside bg-slate-50 dark:bg-[#00061A]/80 p-4 rounded-2xl border border-slate-200 dark:border-[#002060]">
+                    {selectedItem.briefing_json.principais_topicos.map((topico, idx) => (
+                      <li key={idx} className="leading-relaxed">
+                        {topico}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Decisões e Próximos Passos */}
+              {selectedItem.briefing_json?.decisoes_proximos_passos && selectedItem.briefing_json.decisoes_proximos_passos.length > 0 && (
+                <div>
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 font-display">
+                    Decisões & Próximos Passos
+                  </h4>
+                  <ul className="space-y-1.5 text-xs text-emerald-950 dark:text-emerald-200 list-disc list-inside bg-emerald-50/60 dark:bg-emerald-950/25 p-4 rounded-2xl border border-emerald-200 dark:border-emerald-800/60">
+                    {selectedItem.briefing_json.decisoes_proximos_passos.map((decisao, idx) => (
+                      <li key={idx} className="leading-relaxed font-medium">
+                        {decisao}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Pontos de Atenção */}
+              {selectedItem.briefing_json?.pontos_atencao && selectedItem.briefing_json.pontos_atencao.length > 0 && (
+                <div>
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 font-display">
+                    Pontos de Atenção para a Próxima Reunião
+                  </h4>
+                  <ul className="space-y-1.5 text-xs text-amber-900 dark:text-amber-300 list-disc list-inside bg-amber-50/60 dark:bg-amber-950/25 p-4 rounded-2xl border border-amber-200 dark:border-amber-800/60">
+                    {selectedItem.briefing_json.pontos_atencao.map((ponto, idx) => (
+                      <li key={idx} className="leading-relaxed">
+                        {ponto}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Vínculo Pipedrive CRM */}
+              {(selectedItem.briefing_json?.pipedrive?.deal_id || selectedItem.briefing_json?.pipedrive?.person_id) && (
+                <div>
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 font-display">
+                    Vínculo no Pipedrive CRM
+                  </h4>
+                  <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#00061A]/80 border border-slate-200 dark:border-[#002060] text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      {selectedItem.briefing_json?.pipedrive?.person_id && (
+                        <a
+                          href={selectedItem.briefing_json.pipedrive.person_url || `https://investimentosblue.pipedrive.com/person/${selectedItem.briefing_json.pipedrive.person_id}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 text-[#0092FF] dark:text-[#00FFFF] font-bold text-xs hover:bg-blue-100 dark:hover:bg-blue-900/60 transition-colors"
+                        >
+                          <span>👤 Pessoa #{selectedItem.briefing_json.pipedrive.person_id}</span>
+                          <ArrowUpRight className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                      {selectedItem.briefing_json?.pipedrive?.deal_id && (
+                        <a
+                          href={selectedItem.briefing_json.pipedrive.deal_url || `https://investimentosblue.pipedrive.com/deal/${selectedItem.briefing_json.pipedrive.deal_id}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-[#002060] text-white font-semibold text-xs hover:bg-[#001D99] transition-colors"
+                        >
+                          <span>💼 Deal #{selectedItem.briefing_json.pipedrive.deal_id}</span>
+                          <ArrowUpRight className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                      {selectedItem.briefing_json?.pipedrive?.note_id && (
+                        <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-300 font-bold text-xs">
+                          <span>📝 Nota Briefing #{selectedItem.briefing_json.pipedrive.note_id}</span>
+                        </span>
+                      )}
+                      {!selectedItem.briefing_json?.pipedrive?.note_id && selectedItem.briefing_json?.pipedrive?.activity_id && (
+                        <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-300 font-bold text-xs">
+                          <span>⚡ Atividade Tactiq #{selectedItem.briefing_json.pipedrive.activity_id}</span>
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center space-x-2">
+                      <button
+                        onClick={() => {
+                          const it = selectedItem
+                          setSelectedItem(null)
+                          handleOpenAssignModal(it)
+                        }}
+                        className="inline-flex items-center space-x-1 px-3 py-1.5 rounded-lg bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 text-[#0092FF] dark:text-[#00FFFF] font-bold text-xs hover:bg-blue-100 dark:hover:bg-blue-900/60 transition-colors"
+                      >
+                        <Edit3 className="w-3 h-3" />
+                        <span>Alterar Vínculo</span>
+                      </button>
+
+                      <button
+                        onClick={() => handleUnlinkTranscription(selectedItem)}
+                        disabled={unlinkingId === selectedItem.id}
+                        className="inline-flex items-center space-x-1 px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-800/60 text-rose-600 dark:text-rose-400 font-bold text-xs hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors"
+                      >
+                        <Unlink className={`w-3 h-3 ${unlinkingId === selectedItem.id ? 'animate-spin' : ''}`} />
+                        <span>{unlinkingId === selectedItem.id ? 'Desvinculando...' : 'Desvincular'}</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="p-4 border-t border-slate-200 dark:border-[#002060] bg-slate-50 dark:bg-[#00061A] flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                {!selectedItem.briefing_json?.pipedrive?.deal_id && !selectedItem.briefing_json?.pipedrive?.person_id && (
+                  <button
+                    onClick={() => {
+                      const it = selectedItem
+                      setSelectedItem(null)
+                      handleOpenAssignModal(it)
+                    }}
+                    className="inline-flex items-center space-x-1.5 px-3.5 py-2 rounded-xl bg-[#0092FF] hover:bg-[#007AFF] text-white font-bold text-xs transition-all shadow-xs"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Atribuir ao Pipedrive Agora</span>
+                  </button>
+                )}
+
+                <button
+                  onClick={() => handleToggleIgnore(selectedItem.id)}
+                  disabled={togglingIgnoreId === selectedItem.id}
+                  className="inline-flex items-center space-x-1.5 px-3 py-2 rounded-xl border border-slate-200 dark:border-[#002060] text-slate-600 dark:text-slate-300 font-bold text-xs hover:bg-slate-100 dark:hover:bg-[#002060] transition-colors"
+                >
+                  {selectedItem.briefing_json?.is_ignored ? (
+                    <>
+                      <Eye className="w-3.5 h-3.5 text-blue-500" />
+                      <span>Reativar Notificações</span>
+                    </>
+                  ) : (
+                    <>
+                      <EyeOff className="w-3.5 h-3.5 text-slate-400" />
+                      <span>Marcar como Reunião Interna</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  onClick={() => handleDeleteTranscription(selectedItem)}
+                  disabled={deletingId === selectedItem.id}
+                  className="inline-flex items-center space-x-1.5 px-3 py-2 rounded-xl border border-rose-200 dark:border-rose-900/60 text-rose-500 hover:text-rose-700 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 font-bold text-xs transition-colors"
+                  title="Excluir do painel e remover do Pipedrive"
+                >
+                  <Trash2 className={`w-3.5 h-3.5 ${deletingId === selectedItem.id ? 'animate-spin' : ''}`} />
+                  <span>{deletingId === selectedItem.id ? 'Excluindo...' : 'Excluir'}</span>
+                </button>
+              </div>
+
+              <button
+                onClick={() => setSelectedItem(null)}
+                className="ml-auto px-4 py-2 rounded-xl text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#002060] transition-colors"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sugestoes de cadastro extraidas da reuniao */}
+      {sugestoesDe && (
+        <SugestoesCadastro
+          transcriptionId={sugestoesDe}
+          apiUrl={API_URL}
+          onFechar={() => setSugestoesDe(null)}
+          onAplicado={fetchTranscriptions}
+        />
+      )}
+
+      {/* Por que o vinculo automatico falhou */}
+      {motivoAberto && (
+        <MotivoVinculo
+          vinculo={motivoAberto}
+          reavaliando={reavaliando}
+          onFechar={() => setMotivoAberto(null)}
+          onTentarNovamente={handleTentarNovamente}
+          onVincularManual={() => {
+            const item = itemDoMotivo
+            setMotivoAberto(null)
+            if (item) handleOpenAssignModal(item)
+          }}
+        />
+      )}
+    </div>
+  )
+}

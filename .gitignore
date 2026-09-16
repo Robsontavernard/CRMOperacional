@@ -1,0 +1,74 @@
+# Dependencies & Environments
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+
+# Environment Variables & Secrets (CRITICAL FOR PUBLIC REPOS)
+.env
+.env.local
+.env.*.local
+*.env
+backend/.env
+frontend/.env.local
+!.env.example
+!backend/.env.example
+!frontend/.env.example
+
+# Google Cloud Credentials & Service Accounts
+credentials/
+backend/credentials/
+*-service-account.json
+service-account.json
+credentials.json
+*.pem
+*.key
+
+# IDEs & System files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Next.js & Build Output
+dist/
+build/
+.next/
+out/
+
+# Logs & Temp
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.coverage
+htmlcov/
+.pytest_cache/
+.cache/
+.temp/
+.tmp/
+scratch/
+
+# Temporary Screenshots
+duvida.png
+
+# Fichas cadastrais. Sao formularios com nome, CPF, nome da mae, endereco,
+# renda e conta bancaria de pessoas reais. Ficam na maquina, nunca no git.
+Treinamento/
+*.pdf
+
+# Exports da MAG usados como fixture de teste da Base de Clientes.
+# Carregam CPF, telefone, e-mail, endereco e renda de 209 pessoas reais —
+# ficam na maquina, nunca no historico do git.
+*.xlsx
+*.xls
+*.csv
