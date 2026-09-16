@@ -57,10 +57,26 @@ GOOGLE_DRIVE_FOLDER_NAME = "Briefing - Tactiq"
 # FastAPI app
 app = FastAPI(title="Automação Tactiq-Pipedrive", version="1.0.0")
 
-# CORS - Permite Vercel, Render, localhost e qualquer origem
+# CORS: domínios do frontend em `CORS_ORIGINS`, separados por vírgula.
+#
+# O padrão continua `*` de propósito. Restringir por omissão quebraria a
+# aplicação inteira em silêncio — requisição bloqueada pelo navegador não vira
+# erro no servidor, e quem recebesse este sistema sem conhecê-lo veria só telas
+# vazias, sem nada no log para onde olhar. O aviso abaixo é o meio-termo: segue
+# funcionando, mas a lacuna aparece na primeira linha do startup.
+CORS_ORIGINS = [
+    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+]
+if not CORS_ORIGINS:
+    CORS_ORIGINS = ["*"]
+    logger.warning(
+        "CORS_ORIGINS não definido: a API aceita requisição de qualquer origem. "
+        "Em produção, defina os domínios do frontend (ex.: https://app.vercel.app)."
+    )
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )

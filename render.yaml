@@ -1,0 +1,57 @@
+# Backend FastAPI no Render.
+#
+# Aplicar: Render → New → Blueprint → aponte para este repositório.
+# As variáveis marcadas `sync: false` NÃO ficam aqui: o Render pergunta o valor
+# na criação e guarda cifrado. Nenhum segredo neste arquivo, que é versionado.
+#
+# `plan: starter` não é preferência: o plano free hiberna após 15 minutos sem
+# requisição, e hibernar mata o APScheduler. A sincronização do Drive roda de 5
+# em 5 minutos e o alerta comercial às 7h — as duas param de acontecer, sem
+# erro nenhum, só silêncio.
+
+services:
+  - type: web
+    name: crm-operacional-api
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: backend
+    # Uma instância só. Com duas, cada uma sobe o próprio APScheduler e os jobs
+    # disparam em dobro: transcrição sincronizada duas vezes, alerta comercial
+    # enviado duas vezes.
+    numInstances: 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
+      # --- obrigatórias ---
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: PIPEDRIVE_API_TOKEN
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true  # o Render gera; não reaproveite o segredo local
+
+      # Aceita o conteúdo do JSON colado direto, Base64 ou caminho de arquivo —
+      # ver `get_drive_service()` em main.py. No Render use o JSON colado: não
+      # há arquivo para apontar.
+      - key: GOOGLE_DRIVE_SERVICE_ACCOUNT_JSON
+        sync: false
+
+      # --- assistente (cascata Gemini → NVIDIA) ---
+      # Sem elas o resto do sistema funciona; só o assistente para de responder.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+
+      # --- CORS ---
+      # Domínios do frontend, separados por vírgula. Preencher depois que a
+      # Vercel devolver a URL. Ver a nota em main.py sobre o padrão.
+      - key: CORS_ORIGINS
+        sync: false
