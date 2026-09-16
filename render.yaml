@@ -14,7 +14,10 @@ services:
     name: crm-operacional-api
     runtime: python
     plan: starter
-    region: oregon
+    # O Render não tem região na América do Sul. Virginia é a mais próxima do
+    # Brasil entre as disponíveis — a API é chamada a cada interação da tela, e
+    # Oregon custaria cerca de 60ms a mais em todas elas.
+    region: virginia
     rootDir: backend
     # Uma instância só. Com duas, cada uma sobe o próprio APScheduler e os jobs
     # disparam em dobro: transcrição sincronizada duas vezes, alerta comercial
