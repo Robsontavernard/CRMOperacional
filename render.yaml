@@ -4,25 +4,29 @@
 # As variáveis marcadas `sync: false` NÃO ficam aqui: o Render pergunta o valor
 # na criação e guarda cifrado. Nenhum segredo neste arquivo, que é versionado.
 #
-# `plan: starter` não é preferência: o plano free hiberna após 15 minutos sem
-# requisição, e hibernar mata o APScheduler. A sincronização do Drive roda de 5
-# em 5 minutos e o alerta comercial às 7h — as duas param de acontecer, sem
-# erro nenhum, só silêncio.
+# `plan: free` é temporário, escolhido para colocar o sistema no ar.
+#
+# O free hiberna após ~15 minutos sem requisição, e hibernar encerra o processo.
+# Com ele morre o APScheduler: a sincronização do Drive (a cada 5 min) e o
+# alerta comercial (7h) só rodam enquanto alguém estiver usando a tela. Não dá
+# erro — o sistema fica quieto.
+#
+# **Ao contratar um plano pago, troque para `plan: starter`.** É a única
+# alteração necessária: os jobs voltam a rodar sozinhos, sem mais nada a mudar.
 
 services:
   - type: web
     name: crm-operacional-api
     runtime: python
-    plan: starter
-    # O Render não tem região na América do Sul. Virginia é a mais próxima do
-    # Brasil entre as disponíveis — a API é chamada a cada interação da tela, e
-    # Oregon custaria cerca de 60ms a mais em todas elas.
-    region: virginia
+    plan: free
+    # O Render não tem região na América do Sul. Confira no painel quais regiões
+    # o plano free oferece: se Virginia estiver disponível, é a mais próxima do
+    # Brasil e economiza cerca de 60ms em cada chamada da tela.
+    region: oregon
     rootDir: backend
-    # Uma instância só. Com duas, cada uma sobe o próprio APScheduler e os jobs
-    # disparam em dobro: transcrição sincronizada duas vezes, alerta comercial
-    # enviado duas vezes.
-    numInstances: 1
+    # Sem `numInstances`: o free só permite uma, e é o que queremos. Com duas,
+    # cada uma subiria o próprio APScheduler e os jobs disparariam em dobro —
+    # transcrição sincronizada duas vezes, alerta comercial enviado duas vezes.
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
